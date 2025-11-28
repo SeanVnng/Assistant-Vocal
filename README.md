@@ -101,3 +101,6 @@ C'est la version recommandée avec l'interface sombre, les logs système et la g
 
 ```bash
 python main.py
+```
+
+Réalisé par Seann
