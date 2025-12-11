@@ -1,55 +1,55 @@
-# 🧠 NEXUS AI - Advanced Multimodal Assistant
+# 🧠 NEXUS AI - Groq Edition
 
 ![Python](https://img.shields.io/badge/Python-3.10%2B-blue?style=for-the-badge&logo=python)
-![Gemini](https://img.shields.io/badge/Model-Gemini%202.0%20Flash-orange?style=for-the-badge&logo=google)
-![ElevenLabs](https://img.shields.io/badge/TTS-ElevenLabs-white?style=for-the-badge)
+![Groq](https://img.shields.io/badge/Moteur-Groq%20LPU-orange?style=for-the-badge&logo=fastapi)
+![Llama](https://img.shields.io/badge/Model-Llama%203.2%20Vision-blueviolet?style=for-the-badge)
 ![Qt](https://img.shields.io/badge/GUI-PySide6-green?style=for-the-badge&logo=qt)
 
-**NEXUS AI** est un assistant de bureau de nouvelle génération. Il ne se contente pas de vous écouter : **il voit ce que vous voyez**. Grâce à l'intégration profonde de l'API **Google Gemini Live** et d'**OpenCV**, NEXUS peut analyser votre flux webcam ou votre écran en temps réel tout en conversant naturellement avec une voix ultra-réaliste via **ElevenLabs**.
+**NEXUS AI** est un assistant de bureau multimodal ultra-rapide. Il utilise la puissance des **LPU Groq** pour une latence quasi nulle et intègre des modèles de vision **Llama 3.2** pour "voir" votre monde.
+
+Contrairement aux assistants classiques, NEXUS peut analyser votre webcam ou votre écran en temps réel, exécuter des commandes système (ouvrir des applications, sites web) et converser vocalement, le tout via une interface graphique moderne et réactive.
 
 ---
 
 ## ✨ Fonctionnalités Principales
 
-* **👁️ Vision Temps Réel :**
-    * **Mode Caméra :** L'IA voit votre environnement physique (Scan automatique des ports caméra).
-    * **Mode Écran :** L'IA regarde votre écran pour vous aider à coder, lire des documents ou naviguer.
-    * *Instruction Système Avancée :* Gemini est configuré pour analyser les flux vidéo en continu.
-* **🗣️ Conversation Fluide :**
-    * Latence ultra-faible grâce aux WebSockets.
-    * Voix réaliste et expressive (ElevenLabs Turbo v2.5).
-    * Visualiseur audio dynamique dans l'interface.
-* **🛠️ Outils Système & Agents :**
-    * **Fichiers :** Création, lecture et modification de fichiers/dossiers.
-    * **Navigation :** Recherche Google et ouverture de sites web.
-    * **Apps :** Lancement d'applications de bureau.
-    * **Code :** Exécution et analyse de code Python.
+* **👁️ Vision Multimodale :**
+    * **Mode Caméra :** Analyse de votre environnement physique via webcam (HD 720p).
+    * **Mode Écran :** Capture et analyse de votre bureau pour vous aider sur vos tâches.
+    * *Technologie :* Utilisation de `Llama-3.2-Vision` via l'API Groq pour une description instantanée.
+* **⚡ Vitesse & Intelligence :**
+    * Propulsé par **Groq** (Inférence IA la plus rapide du monde).
+    * Réponses concises et pertinentes en Français.
+* **🛠️ Contrôle Système :**
+    * **Commandes Vocales/Texte :** Demandez *"Ouvre Spotify"* ou *"Lance Google"* et NEXUS s'exécute.
+    * **Support :** Sites web (URL) et Applications locales (exe/binaires).
+* **🗣️ Interaction Vocale :**
+    * **STT (Écoute) :** Reconnaissance vocale Google (SpeechRecognition).
+    * **TTS (Parole) :** Synthèse vocale locale rapide et sans latence (pyttsx3).
 * **🖥️ Interface Moderne :**
-    * GUI sombre et minimaliste (Dark Theme).
-    * Double affichage : Chat utilisateur vs Logs système (pour voir ce que l'IA fait en arrière-plan).
+    * GUI sombre (Dark Theme) avec accents orange.
+    * Visualiseur audio dynamique.
+    * Double affichage : Chat + Retour Vidéo/Logs.
 
 ---
 
 ## ⚙️ Prérequis
 
-Avant de commencer, assurez-vous d'avoir installé :
-
 * **Python 3.10** ou supérieur.
-* **Clé API Google Gemini** (Google AI Studio).
-* **Clé API ElevenLabs** (Pour la synthèse vocale).
-* *(Optionnel pour la version Wake-Word)* **Clé Picovoice Access Key**.
+* Une **Clé API Groq** (Gratuite et disponible sur [console.groq.com](https://console.groq.com)).
+* Un microphone et une webcam.
 
 ---
 
 ## 🚀 Installation
 
-1.  **Cloner le dépôt :**
+1.  **Cloner le projet :**
     ```bash
     git clone [https://github.com/votre-username/nexus-ai.git](https://github.com/votre-username/nexus-ai.git)
     cd nexus-ai
     ```
 
-2.  **Créer un environnement virtuel (recommandé) :**
+2.  **Créer un environnement virtuel :**
     ```bash
     python -m venv venv
     # Windows
@@ -59,48 +59,42 @@ Avant de commencer, assurez-vous d'avoir installé :
     ```
 
 3.  **Installer les dépendances :**
-    Créez un fichier `requirements.txt` avec le contenu ci-dessous, puis installez-le :
-    
-    *Contenu de `requirements.txt` :*
-    ```text
-    google-genai
-    python-dotenv
-    opencv-python
-    pyaudio
-    Pillow
-    PySide6
-    websockets
-    numpy
-    pvporcupine
-    ```
-
-    **Commande d'installation :**
     ```bash
     pip install -r requirements.txt
     ```
 
-    > **Note pour Linux :** Vous devrez peut-être installer `portaudio19-dev` (`sudo apt install portaudio19-dev`) pour PyAudio.
+    *Contenu du `requirements.txt` :*
+    ```text
+    PySide6
+    groq
+    python-dotenv
+    SpeechRecognition
+    pyttsx3
+    opencv-python
+    numpy
+    Pillow
+    pyaudio
+    ```
 
-4.  **Configuration des clés API :**
-    Créez un fichier `.env` à la racine du projet et remplissez-le comme suit :
+    > **Note :** Si vous rencontrez une erreur avec `pyaudio`, installez `pipwin install pyaudio` (Windows) ou `sudo apt install portaudio19-dev` (Linux).
+
+4.  **Configuration (.env) :**
+    Créez un fichier nommé `.env` à la racine et ajoutez votre clé :
 
     ```ini
-    GEMINI_API_KEY=votre_cle_gemini_ici
-    ELEVENLABS_API_KEY=votre_cle_elevenlabs_ici
-    
-    # Requis uniquement pour la version test2.py (Wake Word)
-    PICOVOICE_API_KEY=votre_cle_picovoice_ici
+    # Clé API Groq (Obligatoire)
+    GROQ_API_KEY=gsk_votre_cle_ici...
+
+    # Configuration Modèles (Optionnel, valeurs par défaut)
+    MODEL_TEXT=meta-llama/llama-4-scout-17b-16e-instruct
+    MODEL_VISION=meta-llama/llama-4-scout-17b-16e-instruct
     ```
 
 ---
 
 ## 🎮 Utilisation
 
-### Lancer la version principale (GUI Moderne)
-C'est la version recommandée avec l'interface sombre, les logs système et la gestion avancée de la vision.
+Lancez simplement le script principal :
 
 ```bash
-python main.py
-```
-
-Réalisé par Seann
+python final_nexus.py
