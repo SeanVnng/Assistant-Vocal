@@ -8,15 +8,12 @@ import subprocess
 import webbrowser
 from html import escape
 import json 
-import time # Utilisé pour le timeout STT
+import time
 
 # --- IMPORTS AUDIO ET ASYNCHRONES NÉCESSAIRES ---
 import websockets 
 import pyaudio 
 from dotenv import load_dotenv 
-
-# --- NOUVEL IMPORT POUR LA RECONNAISSANCE VOCALE (STT) ---
-import speech_recognition as sr # Nécessite 'pip install SpeechRecognition'
 
 # --- GUI Imports ---
 from PySide6.QtWidgets import (
@@ -46,13 +43,15 @@ if not GEMINI_API_KEY or not ELEVENLABS_API_KEY:
 
 
 MODEL_ID = "gemini-2.5-flash"
-RECV_RATE = 24000
-CHUNK_AUDIO = 1024
+
+# Configuration Audio
+RECV_RATE = 24000 # Sample rate pour la sortie TTS
+MIC_RATE = 16000  # Sample rate pour l'entrée Microphone (Standard pour STT)
+CHUNK_SIZE = 1024 # Taille des fragments pour PyAudio
 
 MODE_TEXT = 0
 MODE_CAMERA = 1
 MODE_SCREEN = 2
-
 
 # ==============================================================================
 # 1. ANIMATION AUDIO
@@ -97,7 +96,7 @@ class AudioVisualizer(QWidget):
 
 
 # ======================================================
-# ===================== BACKEND (Fusionné) =============
+# ===================== BACKEND (RTSTT) ================
 # ======================================================
 
 class Backend(QObject):
@@ -105,14 +104,16 @@ class Backend(QObject):
     image_out = Signal(QImage)
     logs_out = Signal(str, str)
     voice_state = Signal(bool) 
-    stt_out = Signal(str) # Signal pour renvoyer le texte reconnu
+    stt_out = Signal(str) # Texte final reconnu
+    stt_status = Signal(str) # État du STT (Connexion/Écoute/Déconnexion)
+    stt_partial = Signal(str) # Texte partiel en temps réel
 
     def __init__(self):
         super().__init__()
         self.mode = MODE_TEXT
         self.running = True
         self.current_frame = None  
-        self.stt_active = False # État de l'enregistrement vocal
+        self.stt_active = False # Contrôle le streaming du microphone
 
         self.loop = asyncio.new_event_loop()
         self.client = genai.Client(api_key=GEMINI_API_KEY) 
@@ -122,10 +123,10 @@ class Backend(QObject):
         self.q_vision = asyncio.Queue()  
         self.q_tts_in = asyncio.Queue()    
         self.q_audio_out = asyncio.Queue() 
+        self.q_mic_out = asyncio.Queue() # Nouvelle file pour les données microphone
         
         self.last_send_time = 0
-        self.recognizer = sr.Recognizer() # Initialisation du Recognizer
-        self.microphone = sr.Microphone() # Initialisation du microphone
+        self.stt_websocket_task = None
 
     def start(self):
         threading.Thread(
@@ -137,7 +138,135 @@ class Backend(QObject):
         self.running = False
         
     # ======================================================
+    # ========== TASK MIC INPUT (PyAudio) ==================
+    # ======================================================
+    async def task_mic_input(self):
+        """Capture les données du microphone et les envoie à la file d'attente."""
+        try:
+            # Démarrer le stream PyAudio pour l'entrée
+            stream = self.pya.open(
+                format=pyaudio.paInt16, 
+                channels=1, 
+                rate=MIC_RATE, 
+                input=True,
+                frames_per_buffer=CHUNK_SIZE
+            )
+            self.logs_out.emit("INFO", "Microphone stream démarré.")
+            
+            while self.running:
+                # Lire les données du microphone de manière non bloquante
+                if self.stt_active:
+                    data = await asyncio.to_thread(stream.read, CHUNK_SIZE, exception_on_overflow=False)
+                    await self.q_mic_out.put(data)
+                else:
+                    await asyncio.sleep(0.1) # Attend si le STT est désactivé
+                    
+        except Exception as e:
+            self.logs_out.emit("CRITICAL", f"Erreur PyAudio Input: {e}")
+        finally:
+            if 'stream' in locals() and stream.is_active():
+                stream.stop_stream()
+                stream.close()
+
+    # ======================================================
+    # ========== TASK STT WEBSOCKET (REALTIME) =============
+    # ======================================================
+    async def task_stt_websocket(self):
+        """Envoie l'audio du micro à un service STT en streaming et reçoit le texte."""
+        # NOTE: Ceci est un PROTOCOLE HYPOTHÉTIQUE, car nous n'avons pas d'API RTSTT standard.
+        # Le protocole ElevenLabs STT n'est pas public. Nous utilisons ici une structure générique.
+        
+        # URI ElevenLabs (hypothétique RTSTT)
+        # Note: L'API publique d'ElevenLabs pour le STT n'est pas par WebSocket pour l'instant.
+        # Si vous utilisez Google Cloud STT, l'URI et le protocole seraient différents.
+        uri = "wss://rtstt.service-example.com/ws" 
+        
+        self.stt_status.emit("Prêt pour STT. Appuyez pour parler.")
+
+        while self.running:
+            if not self.stt_active:
+                await asyncio.sleep(0.5)
+                continue
+                
+            self.stt_status.emit("Connexion STT...")
+            
+            try:
+                # Début de la session WebSocket
+                async with websockets.connect(uri) as ws:
+                    self.stt_status.emit("Écoute en cours...")
+                    self.logs_out.emit("INFO", "STT: WebSocket Connecté. Début du streaming.")
+                    
+                    # Tâche pour envoyer l'audio
+                    async def send_mic_data():
+                        # Envoyer les paramètres audio initiaux
+                        await ws.send(json.dumps({
+                            "type": "config", 
+                            "api_key": ELEVENLABS_API_KEY,
+                            "rate": MIC_RATE, 
+                            "language": "fr-FR"
+                        }))
+                        
+                        while self.stt_active and self.running:
+                            try:
+                                # Envoie les fragments audio PyAudio
+                                data = await self.q_mic_out.get()
+                                
+                                # Envoi des données audio encodées en base64
+                                await ws.send(json.dumps({
+                                    "type": "audio", 
+                                    "data": base64.b64encode(data).decode('utf-8')
+                                }))
+                                self.q_mic_out.task_done()
+                            except asyncio.QueueEmpty:
+                                await asyncio.sleep(0.01)
+                            except websockets.exceptions.ConnectionClosedOK:
+                                break
+                            
+                        # Signal de fin de transmission
+                        await ws.send(json.dumps({"type": "end"}))
+                        
+                    # Tâche pour recevoir le texte
+                    async def receive_text():
+                        nonlocal last_text
+                        last_text = ""
+                        while self.stt_active and self.running:
+                            try:
+                                message = await ws.recv()
+                                data = json.loads(message)
+                                
+                                if data.get("text_partial"):
+                                    self.stt_partial.emit(data["text_partial"])
+                                    
+                                if data.get("text_final"):
+                                    final_text = data["text_final"]
+                                    self.stt_out.emit(final_text)
+                                    self.logs_out.emit("INFO", f"STT Final: {final_text}")
+                                    
+                                    # Déclenche la requête Gemini et arrête l'enregistrement
+                                    self.loop.call_soon_threadsafe(self.q_text.put_nowait, final_text)
+                                    self.stt_active = False # Arrêt du streaming
+                                    break
+                                    
+                            except websockets.exceptions.ConnectionClosedOK:
+                                break
+                            except Exception as e:
+                                self.logs_out.emit("ERR", f"STT Receive Error: {e}")
+                                break
+                    
+                    # Exécuter les deux tâches simultanément
+                    await asyncio.gather(send_mic_data(), receive_text())
+                    
+            except websockets.exceptions.ConnectionRefused as e:
+                self.logs_out.emit("ERR", f"STT Connexion refusée. Le serveur est-il actif ? {e}")
+            except Exception as e: 
+                self.logs_out.emit("ERR", f"STT WebSocket Fatal Error: {e}")
+            finally: 
+                self.stt_active = False
+                self.stt_status.emit("Prêt pour STT. Appuyez pour parler.")
+
+    # ======================================================
     # ========== TASK TTS (Websocket - Streaming) ==========
+    # ... (inchangé)
     # ======================================================
     async def task_tts(self):
         uri = f"wss://api.elevenlabs.io/v1/text-to-speech/{VOICE_ID}/stream-input?model_id=eleven_turbo_v2_5&output_format=pcm_24000"
@@ -187,182 +316,6 @@ class Backend(QObject):
             self.logs_out.emit("CRITICAL", f"PyAudio Output Error: {e}. PyAudio installé ?")
 
     # ======================================================
-    # ========== TASK STT (Speech-to-Text) =================
-    # ======================================================
-    def stt_task(self):
-        self.stt_active = True
-        self.logs_out.emit("INFO", "STT: Écoute démarrée...")
-        self.stt_out.emit("Écoute en cours...")
-        
-        try:
-            with self.microphone as source:
-                self.recognizer.adjust_for_ambient_noise(source)
-                # Utiliser listen pour capturer l'audio (bloquant)
-                audio = self.recognizer.listen(source, timeout=5, phrase_time_limit=10)
-            
-            self.logs_out.emit("INFO", "STT: Audio capturé. Reconnaissance...")
-            
-            # Utiliser la reconnaissance vocale Google (nécessite une connexion internet)
-            text = self.recognizer.recognize_google(audio, language="fr-FR")
-            
-            self.stt_out.emit(text) # Envoie le texte à la GUI
-            self.logs_out.emit("INFO", f"STT: Reconnu: {text}")
-            
-            # Déclenche la requête Gemini avec le texte reconnu
-            self.loop.call_soon_threadsafe(self.q_text.put_nowait, text)
-            
-        except sr.WaitTimeoutError:
-            self.logs_out.emit("WARN", "STT: Pas de parole détectée (Timeout).")
-            self.stt_out.emit("Timeout...")
-        except sr.UnknownValueError:
-            self.logs_out.emit("WARN", "STT: Parole inintelligible.")
-            self.stt_out.emit("Parole non comprise.")
-        except Exception as e:
-            self.logs_out.emit("ERR", f"STT Error: {e}")
-            self.stt_out.emit(f"Erreur STT: {e}")
-        finally:
-            self.stt_active = False
-            self.logs_out.emit("INFO", "STT: Écoute terminée.")
-
-    # ======================================================
-    # ========== VIDEO FRAME SEND TO GUI ====================
-    # ... (inchangé)
-    # ======================================================
-    def send_to_gui(self, frame):
-        h, w, ch = frame.shape
-        qimg = QImage(frame.data, w, h, w * ch, QImage.Format_BGR888)
-        self.image_out.emit(qimg.copy())
-
-    # ======================================================
-    # ========== CAMERA CAPTURE =============================
-    # ... (inchangé)
-    # ======================================================
-    async def camera_loop(self):
-        cap = None
-        while self.running:
-            if self.mode != MODE_CAMERA:
-                await asyncio.sleep(0.2)
-                continue
-
-            if cap is None or not cap.isOpened():
-                for i in range(3):
-                    cam = cv2.VideoCapture(i)
-                    if cam.isOpened():
-                        ret, test = cam.read()
-                        if ret:
-                            cap = cam
-                            break
-                        cam.release()
-
-                if cap is None:
-                    await asyncio.sleep(1)
-                    continue
-
-            ret, frame = await asyncio.to_thread(cap.read)
-            if not ret:
-                cap.release()
-                cap = None
-                await asyncio.sleep(0.2)
-                continue
-
-            self.send_to_gui(frame)
-            self.current_frame = frame
-            
-            await asyncio.sleep(0.05)
-
-    # ======================================================
-    # ========== SCREEN CAPTURE =============================
-    # ... (inchangé)
-    # ======================================================
-    async def screen_loop(self):
-        while self.running:
-            if self.mode != MODE_SCREEN:
-                await asyncio.sleep(0.2)
-                continue
-
-            img = await asyncio.to_thread(ImageGrab.grab)
-            frame = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
-
-            self.send_to_gui(frame)
-            self.current_frame = frame
-            
-            await asyncio.sleep(0.1)
-
-    # ======================================================
-    # ========== SYSTEM COMMAND EXECUTION ===================
-    # ... (inchangé)
-    # ======================================================
-    def execute_system_command(self, command: str):
-        self.logs_out.emit("INFO", f"Tentative d'exécution de: {command}")
-        
-        try:
-            if sys.platform.startswith('win'):
-                subprocess.run(f'start {command}', shell=True, check=True)
-            elif sys.platform == 'darwin': 
-                subprocess.run(['open', command], check=True)
-            else: 
-                subprocess.run(['xdg-open', command], check=True)
-            
-            return f"Commande '{command}' exécutée avec succès (tentative de lancement)."
-                
-        except subprocess.CalledProcessError as e:
-            return f"[ERREUR SYSTÈME] Échec de la commande: {e}"
-        except FileNotFoundError:
-             return f"[ERREUR SYSTÈME] Application ou commande non trouvée: {command}"
-        except Exception as e:
-            return f"[ERREUR SYSTÈME] Erreur inattendue: {e}"
-
-    # ======================================================
-    # ========== MODEL CALL =================================
-    # ... (inchangé)
-    # ======================================================
-    def model_call(self, contents):
-        try:
-            resp = self.client.models.generate_content(
-                model=MODEL_ID,
-                contents=contents
-            )
-            return resp.text if hasattr(resp, "text") else str(resp)
-
-        except Exception as e:
-            return f"[API ERROR] {str(e)}"
-
-    # ======================================================
-    # ========== IMAGE ANALYSIS =============================
-    # ======================================================
-    async def analyze_image(self, prompt: str): 
-        if self.current_frame is None:
-            self.logs_out.emit("WARN", "Pas d'image actuelle pour l'analyse.")
-            return
-
-        try:
-            frame = self.current_frame
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            pil = PILImage.fromarray(rgb)
-            
-            pil.thumbnail((800, 800)) 
-            
-            buf = io.BytesIO()
-            pil.save(buf, format="JPEG") 
-            img_bytes = buf.getvalue()
-
-            img_part = Part.from_bytes(
-                data=img_bytes,
-                mime_type='image/jpeg' 
-            )
-
-            result = await asyncio.to_thread(
-                self.model_call,
-                [img_part, prompt] 
-            )
-
-            self.text_out.emit(result)
-            self.loop.call_soon_threadsafe(self.q_tts_in.put_nowait, result) 
-
-        except Exception as e:
-            self.logs_out.emit("ERR", str(e))
-
-    # ======================================================
     # ========== MAIN BACKEND LOOP (MAJ AUDIO) =============
     # ======================================================
     async def main_loop(self):
@@ -373,6 +326,9 @@ class Backend(QObject):
         asyncio.create_task(self.screen_loop())
         asyncio.create_task(self.task_tts())
         asyncio.create_task(self.task_audio_output())
+        asyncio.create_task(self.task_mic_input()) # Démarrage de la capture micro
+        # Lancement du STT WebSocket
+        self.stt_websocket_task = asyncio.create_task(self.task_stt_websocket()) 
 
         SYSTEM_PROMPT_COMMAND = (
             "Vous êtes un assistant capable d'exécuter des commandes système. "
@@ -409,7 +365,6 @@ class Backend(QObject):
                 else:
                     # Réponse normale
                     self.text_out.emit(result_text)
-                    # Déclenche la lecture audio par file d'attente TTS
                     self.loop.call_soon_threadsafe(self.q_tts_in.put_nowait, result_text) 
                     
                 self.q_text.task_done()
@@ -423,6 +378,125 @@ class Backend(QObject):
             await asyncio.sleep(0.05)
 
 
+    # ======================================================
+    # ========== AUTRES MÉTHODES DU BACKEND (INCHANGÉES) ===
+    # ======================================================
+    # ... (camera_loop, screen_loop, execute_system_command, model_call, analyze_image) ...
+    async def camera_loop(self):
+        cap = None
+        while self.running:
+            if self.mode != MODE_CAMERA:
+                await asyncio.sleep(0.2)
+                continue
+
+            if cap is None or not cap.isOpened():
+                for i in range(3):
+                    cam = cv2.VideoCapture(i)
+                    if cam.isOpened():
+                        ret, test = cam.read()
+                        if ret:
+                            cap = cam
+                            break
+                        cam.release()
+
+                if cap is None:
+                    await asyncio.sleep(1)
+                    continue
+
+            ret, frame = await asyncio.to_thread(cap.read)
+            if not ret:
+                cap.release()
+                cap = None
+                await asyncio.sleep(0.2)
+                continue
+
+            self.send_to_gui(frame)
+            self.current_frame = frame
+            
+            await asyncio.sleep(0.05)
+
+    async def screen_loop(self):
+        while self.running:
+            if self.mode != MODE_SCREEN:
+                await asyncio.sleep(0.2)
+                continue
+
+            img = await asyncio.to_thread(ImageGrab.grab)
+            frame = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+
+            self.send_to_gui(frame)
+            self.current_frame = frame
+            
+            await asyncio.sleep(0.1)
+
+    def execute_system_command(self, command: str):
+        self.logs_out.emit("INFO", f"Tentative d'exécution de: {command}")
+        
+        try:
+            if sys.platform.startswith('win'):
+                subprocess.run(f'start {command}', shell=True, check=True)
+            elif sys.platform == 'darwin': 
+                subprocess.run(['open', command], check=True)
+            else: 
+                subprocess.run(['xdg-open', command], check=True)
+            
+            return f"Commande '{command}' exécutée avec succès (tentative de lancement)."
+                
+        except subprocess.CalledProcessError as e:
+            return f"[ERREUR SYSTÈME] Échec de la commande: {e}"
+        except FileNotFoundError:
+             return f"[ERREUR SYSTÈME] Application ou commande non trouvée: {command}"
+        except Exception as e:
+            return f"[ERREUR SYSTÈME] Erreur inattendue: {e}"
+
+    def model_call(self, contents):
+        try:
+            resp = self.client.models.generate_content(
+                model=MODEL_ID,
+                contents=contents
+            )
+            return resp.text if hasattr(resp, "text") else str(resp)
+
+        except Exception as e:
+            return f"[API ERROR] {str(e)}"
+
+    async def analyze_image(self, prompt: str): 
+        if self.current_frame is None:
+            self.logs_out.emit("WARN", "Pas d'image actuelle pour l'analyse.")
+            return
+
+        try:
+            frame = self.current_frame
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            pil = PILImage.fromarray(rgb)
+            
+            pil.thumbnail((800, 800)) 
+            
+            buf = io.BytesIO()
+            pil.save(buf, format="JPEG") 
+            img_bytes = buf.getvalue()
+
+            img_part = Part.from_bytes(
+                data=img_bytes,
+                mime_type='image/jpeg' 
+            )
+
+            result = await asyncio.to_thread(
+                self.model_call,
+                [img_part, prompt] 
+            )
+
+            self.text_out.emit(result)
+            self.loop.call_soon_threadsafe(self.q_tts_in.put_nowait, result) 
+
+        except Exception as e:
+            self.logs_out.emit("ERR", str(e))
+
+    def send_to_gui(self, frame):
+        h, w, ch = frame.shape
+        qimg = QImage(frame.data, w, h, w * ch, QImage.Format_BGR888)
+        self.image_out.emit(qimg.copy())
+            
 # ======================================================
 # ======================= GUI ==========================
 # ======================================================
@@ -430,7 +504,7 @@ class Backend(QObject):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("NEXUS – STT Intégration")
+        self.setWindowTitle("NEXUS – Realtime STT Intégration")
         self.resize(1300, 800)
 
         central = QWidget()
@@ -464,10 +538,15 @@ class MainWindow(QMainWindow):
         input_stt_box.addLayout(text_input_box)
         
         # Bouton STT (Nouveau)
-        self.btn_stt = QPushButton("🎙️ Parler à l'IA")
-        self.btn_stt.clicked.connect(self.start_stt)
+        self.btn_stt = QPushButton("🎙️ Démarrer Écoute (RTSTT)")
+        self.btn_stt.clicked.connect(self.toggle_stt)
         self.btn_stt.setEnabled(True)
         input_stt_box.addWidget(self.btn_stt)
+        
+        # Champ pour le texte partiel
+        self.lbl_stt_partial = QLabel("Texte Partiel: ...")
+        self.lbl_stt_partial.setStyleSheet("color: gray; margin-top: -5px;")
+        input_stt_box.addWidget(self.lbl_stt_partial)
 
         left.addLayout(input_stt_box)
         main.addLayout(left, 6)
@@ -514,40 +593,40 @@ class MainWindow(QMainWindow):
         self.backend.image_out.connect(self.update_video)
         self.backend.logs_out.connect(self.add_log)
         self.backend.voice_state.connect(self.visualizer.set_active)
-        self.backend.stt_out.connect(self.on_stt_output) # Connexion du signal STT
+        self.backend.stt_out.connect(self.on_stt_final_output) 
+        self.backend.stt_partial.connect(self.on_stt_partial_output) # Affichage du texte en temps réel
+        self.backend.stt_status.connect(self.update_stt_button) # Mise à jour du bouton
         self.backend.start()
 
-    # --- NOUVELLES MÉTHODES STT ---
-    def start_stt(self):
-        if not self.backend.stt_active:
-            self.btn_stt.setText("🔴 ENREGISTREMENT... (Stop)")
-            self.btn_stt.clicked.disconnect(self.start_stt)
-            self.btn_stt.clicked.connect(self.stop_stt)
-            # Lancer la tâche STT dans un thread séparé (elle est bloquante)
-            threading.Thread(target=self.backend.stt_task, daemon=True).start()
-        else:
-            self.stop_stt()
-
-    def stop_stt(self):
-        # Cette fonction est principalement pour l'interface utilisateur. 
-        # L'arrêt réel se fait par timeout dans la tâche bloquante.
-        self.btn_stt.setText("🎙️ Parler à l'IA")
-        self.btn_stt.clicked.disconnect(self.stop_stt)
-        self.btn_stt.clicked.connect(self.start_stt)
-        # Note: Impossible d'arrêter proprement sr.listen() sans un thread dédié
-        # ou un hack complexe. On se fie au timeout de sr.listen().
+    # --- NOUVELLES MÉTHODES RTSTT ---
+    def toggle_stt(self):
+        """Active/Désactive l'enregistrement du microphone pour le streaming STT."""
+        self.backend.stt_active = not self.backend.stt_active
+        self.update_stt_button(self.backend.stt_status.current_text() if hasattr(self.backend.stt_status, 'current_text') else "Prêt...")
 
     @Slot(str)
-    def on_stt_output(self, text):
-        if text not in ["Écoute en cours...", "Timeout...", "Parole non comprise.", "Erreur STT:"]:
-            # Si un texte réel est reconnu, l'ajouter au chat
-            self.chat.append(f"<b>VOUS (Vocal):</b> {escape(text)}")
-            self.stop_stt() # Reset le bouton après la reconnaissance
-        elif text.startswith("Erreur") or text.endswith("..."):
-            self.stop_stt() # Reset le bouton après un échec/timeout
+    def on_stt_partial_output(self, text):
+        """Affiche le texte partiel reçu pendant le streaming."""
+        self.lbl_stt_partial.setText(f"Texte Partiel: {text}...")
+
+    @Slot(str)
+    def on_stt_final_output(self, text):
+        """Gère le texte final reconnu."""
+        self.chat.append(f"<b>VOUS (Vocal Stream):</b> {escape(text)}")
+        self.lbl_stt_partial.setText("Texte Partiel: ...")
+        # Le backend s'occupe de mettre le texte dans la queue Gemini, pas besoin de le faire ici.
+
+    @Slot(str)
+    def update_stt_button(self, status):
+        """Met à jour le texte et le style du bouton STT."""
+        if self.backend.stt_active:
+            self.btn_stt.setText(f"🔴 ÉCOUTE EN COURS (STOP)")
+            self.btn_stt.setStyleSheet("background-color: red; color: white;")
         else:
-            # Afficher l'état dans la ligne d'entrée ou la barre de logs
-            self.input.setText(f"STT: {text}")
+            self.btn_stt.setText("🎙️ Démarrer Écoute (RTSTT)")
+            self.btn_stt.setStyleSheet("")
+            
+        self.logs.append(f"[STT Status] {status}")
 
 
     # MODE SWITCH
@@ -558,14 +637,15 @@ class MainWindow(QMainWindow):
         self.btn_cam.setChecked(mode == MODE_CAMERA)
         self.btn_screen.setChecked(mode == MODE_SCREEN)
 
+        # Désactive le RTSTT si on n'est pas en mode TEXTE
+        if mode != MODE_TEXT and self.backend.stt_active:
+            self.toggle_stt()
+
         if mode == MODE_TEXT:
             self.video.setText("Aucune source")
             self.btn_stt.setEnabled(True)
-        elif mode == MODE_CAMERA:
-            self.video.setText("Caméra…")
-            self.btn_stt.setEnabled(False)
-        elif mode == MODE_SCREEN:
-            self.video.setText("Capture écran…")
+        else:
+            self.video.setText("Caméra…" if mode == MODE_CAMERA else "Capture écran…")
             self.btn_stt.setEnabled(False)
 
     # MESSAGE SEND
