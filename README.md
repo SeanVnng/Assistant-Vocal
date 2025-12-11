@@ -98,3 +98,5 @@ Lancez simplement le script principal :
 
 ```bash
 python final_nexus.py
+
+Réalisé par Seann
