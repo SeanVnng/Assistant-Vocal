@@ -1,9 +1,9 @@
-google-genai
-python-dotenv
-opencv-python
-pyaudio
-Pillow
 PySide6
-websockets
+groq
+python-dotenv
+SpeechRecognition
+pyttsx3
+opencv-python
 numpy
-pvporcupine
+Pillow
+pyaudio
