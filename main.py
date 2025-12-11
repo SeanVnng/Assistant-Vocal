@@ -1,59 +1,67 @@
-import asyncio
-import base64
-import io
-import os
 import sys
-import traceback
-import json
-import websockets
-import argparse
+import os 
+import io
+import base64
+import asyncio
 import threading
-import math
-import subprocess
+import subprocess 
 import webbrowser
 from html import escape
+import json 
+import time # Utilisé pour le timeout STT
+
+# --- IMPORTS AUDIO ET ASYNCHRONES NÉCESSAIRES ---
+import websockets 
+import pyaudio 
+from dotenv import load_dotenv 
+
+# --- NOUVEL IMPORT POUR LA RECONNAISSANCE VOCALE (STT) ---
+import speech_recognition as sr # Nécessite 'pip install SpeechRecognition'
 
 # --- GUI Imports ---
-from PySide6.QtWidgets import (QApplication, QMainWindow, QTextEdit, QLabel,
-                               QVBoxLayout, QWidget, QLineEdit, QHBoxLayout,
-                               QSizePolicy, QPushButton, QFrame, QScrollArea)
-from PySide6.QtCore import QObject, Signal, Slot, Qt, QTimer
-from PySide6.QtGui import (QImage, QPixmap, QPainter, QColor, QBrush, QPen, QTextCursor)
+from PySide6.QtWidgets import (
+    QApplication, QMainWindow, QTextEdit, QLabel,
+    QVBoxLayout, QWidget, QLineEdit, QHBoxLayout,
+    QPushButton, QFrame
+)
+from PySide6.QtCore import Qt, Slot, Signal, QObject, QTimer, QThread 
+from PySide6.QtGui import QImage, QPixmap, QTextCursor, QPainter, QColor, QBrush 
 
-# --- Media & AI ---
 import cv2
-import pyaudio
-import PIL.Image
-from google import genai
-from dotenv import load_dotenv
-from PIL import ImageGrab
 import numpy as np
+from PIL import ImageGrab, Image as PILImage
 
-# --- Config & Keys ---
+from google import genai
+from google.genai.types import Image, Part 
+
+
+# --- CONFIG & KEYS (Chargement depuis .env) ---
 load_dotenv()
-ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
+VOICE_ID = os.getenv("VOICE_ID", 'pFZP5JQG7iQjIQuC4Bku') 
 
 if not GEMINI_API_KEY or not ELEVENLABS_API_KEY:
-    sys.exit("Error: API Keys manquantes dans le fichier .env")
+    sys.exit("ERREUR: Les clés API (GEMINI_API_KEY ou ELEVENLABS_API_KEY) sont manquantes dans le fichier .env ou l'environnement.")
 
-# Audio Config
-FORMAT = pyaudio.paInt16
-CHANNELS = 1
-SEND_RATE = 16000
+
+MODEL_ID = "gemini-2.5-flash"
 RECV_RATE = 24000
-CHUNK = 1024
-MODEL_ID = "gemini-live-2.5-flash-preview"
-VOICE_ID = 'pFZP5JQG7iQjIQuC4Bku'
+CHUNK_AUDIO = 1024
+
+MODE_TEXT = 0
+MODE_CAMERA = 1
+MODE_SCREEN = 2
+
 
 # ==============================================================================
-# 1. ANIMATION AUDIO (Style Moderne)
+# 1. ANIMATION AUDIO
 # ==============================================================================
 class AudioVisualizer(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setFixedHeight(60)
-        self.bars = 20
+        self.setFixedHeight(30)
+        self.bars = 10
         self.values = [0.1] * self.bars
         self.is_active = False
         self.timer = QTimer(self)
@@ -68,7 +76,7 @@ class AudioVisualizer(QWidget):
 
     def animate(self):
         if self.is_active:
-            self.values = [max(0.1, min(1.0, v + (np.random.rand() - 0.5) * 0.5)) for v in self.values]
+            self.values = [max(0.1, min(1.0, v + (np.random.random() - 0.5) * 0.5)) for v in self.values]
             self.update()
 
     def paintEvent(self, event):
@@ -87,173 +95,61 @@ class AudioVisualizer(QWidget):
             y = (h - bar_h) / 2
             painter.drawRoundedRect(int(x), int(y), int(bar_w - 4), int(bar_h), 4, 4)
 
-# ==============================================================================
-# 2. BACKEND AI (Core Logic)
-# ==============================================================================
-class AssistantBackend(QObject):
-    # Signals
+
+# ======================================================
+# ===================== BACKEND (Fusionné) =============
+# ======================================================
+
+class Backend(QObject):
     text_out = Signal(str)
-    turn_complete = Signal()
     image_out = Signal(QImage)
     logs_out = Signal(str, str)
-    mode_changed = Signal(str)
-    voice_state = Signal(bool)
+    voice_state = Signal(bool) 
+    stt_out = Signal(str) # Signal pour renvoyer le texte reconnu
 
-    def __init__(self, mode="none"):
+    def __init__(self):
         super().__init__()
-        self.mode = mode
+        self.mode = MODE_TEXT
         self.running = True
-        self.client = genai.Client(api_key=GEMINI_API_KEY)
-        self.pya = pyaudio.PyAudio()
-        
-        self.q_gemini_in = asyncio.Queue(maxsize=20)
-        self.q_tts_in = asyncio.Queue()
-        self.q_audio_out = asyncio.Queue()
-        self.q_text_in = asyncio.Queue()
+        self.current_frame = None  
+        self.stt_active = False # État de l'enregistrement vocal
 
-        self.latest_frame = None
         self.loop = asyncio.new_event_loop()
+        self.client = genai.Client(api_key=GEMINI_API_KEY) 
+        self.pya = pyaudio.PyAudio() 
+
+        self.q_text = asyncio.Queue()
+        self.q_vision = asyncio.Queue()  
+        self.q_tts_in = asyncio.Queue()    
+        self.q_audio_out = asyncio.Queue() 
         
-        self.tools_config = [
-            {'google_search': {}}, {'code_execution': {}},
-            {"function_declarations": [
-                {"name": "create_folder", "description": "Create folder", "parameters": {"type": "OBJECT", "properties": {"folder_path": {"type": "STRING"}}, "required": ["folder_path"]}},
-                {"name": "create_file", "description": "Create file", "parameters": {"type": "OBJECT", "properties": {"file_path": {"type": "STRING"}, "content": {"type": "STRING"}}, "required": ["file_path", "content"]}},
-                {"name": "edit_file", "description": "Append to file", "parameters": {"type": "OBJECT", "properties": {"file_path": {"type": "STRING"}, "content": {"type": "STRING"}}, "required": ["file_path", "content"]}},
-                {"name": "list_files", "description": "List dir", "parameters": {"type": "OBJECT", "properties": {"directory_path": {"type": "STRING"}}}},
-                {"name": "read_file", "description": "Read file", "parameters": {"type": "OBJECT", "properties": {"file_path": {"type": "STRING"}}, "required": ["file_path"]}},
-                {"name": "open_application", "description": "Open app", "parameters": {"type": "OBJECT", "properties": {"application_name": {"type": "STRING"}}, "required": ["application_name"]}},
-                {"name": "open_website", "description": "Open URL", "parameters": {"type": "OBJECT", "properties": {"url": {"type": "STRING"}}, "required": ["url"]}},
-            ]}
-        ]
+        self.last_send_time = 0
+        self.recognizer = sr.Recognizer() # Initialisation du Recognizer
+        self.microphone = sr.Microphone() # Initialisation du microphone
 
-    def _run_tool(self, name, args):
-        try:
-            if name == "create_folder": os.makedirs(args["folder_path"], exist_ok=True); return "Folder created."
-            if name == "create_file": 
-                with open(args["file_path"], 'w') as f: f.write(args["content"])
-                return "File created."
-            if name == "edit_file":
-                with open(args["file_path"], 'a') as f: f.write("\n" + args["content"])
-                return "File updated."
-            if name == "read_file":
-                with open(args["file_path"], 'r') as f: return f.read()
-            if name == "list_files":
-                path = args.get("directory_path", ".")
-                return str(os.listdir(path))
-            if name == "open_website": webbrowser.open(args["url"]); return "Website opened."
-            if name == "open_application":
-                subprocess.Popen(args["application_name"], shell=True); return "App launched."
-        except Exception as e: return f"Error: {e}"
-        return "Unknown tool."
+    def start(self):
+        threading.Thread(
+            target=lambda: self.loop.run_until_complete(self.main_loop()),
+            daemon=True
+        ).start()
 
-    async def task_camera(self):
-        print(">>> [INIT] Module Vidéo démarré")
-        cap = None
+    def stop(self):
+        self.running = False
         
-        while self.running:
-            try:
-                frame = None
-                
-                # --- MODE CAMERA (AUTO-DETECT) ---
-                if self.mode == "camera":
-                    # Si la caméra n'est pas ouverte, on la cherche
-                    if cap is None or not cap.isOpened():
-                        print(">>> [CAM] Recherche d'une caméra active...")
-                        found = False
-                        # On teste les ports 0, 1 et 2
-                        for i in range(3):
-                            temp_cap = await asyncio.to_thread(cv2.VideoCapture, i)
-                            if temp_cap.isOpened():
-                                ret, test_frame = await asyncio.to_thread(temp_cap.read)
-                                if ret:
-                                    print(f">>> [CAM] Caméra trouvée à l'index {i}")
-                                    cap = temp_cap
-                                    found = True
-                                    break
-                                else:
-                                    temp_cap.release()
-                        
-                        if not found:
-                            print(">>> [CAM] ERREUR: Aucune caméra fonctionnelle trouvée (testé 0, 1, 2).")
-                            await asyncio.sleep(2) # On attend avant de retester
-                            continue
-
-                    if cap and cap.isOpened():
-                        ret, frame_read = await asyncio.to_thread(cap.read)
-                        if ret:
-                            frame = frame_read
-                        else:
-                            print(">>> [CAM] Erreur lecture frame. Reset...")
-                            cap.release()
-                            cap = None
-                
-                # --- MODE ECRAN ---
-                elif self.mode == "screen":
-                    if cap:
-                        await asyncio.to_thread(cap.release)
-                        cap = None
-                    
-                    try:
-                        screenshot = await asyncio.to_thread(ImageGrab.grab)
-                        frame_np = np.array(screenshot)
-                        frame = cv2.cvtColor(frame_np, cv2.COLOR_RGB2BGR)
-                    except Exception as e:
-                        print(f">>> [SCREEN] Erreur capture écran: {e}")
-                        await asyncio.sleep(1)
-
-                # --- MODE OFF ---
-                else:
-                    if cap:
-                        await asyncio.to_thread(cap.release)
-                        cap = None
-                    await asyncio.sleep(0.1)
-
-                # --- ENVOI A L'INTERFACE ---
-                if frame is not None:
-                    self.latest_frame = frame
-                    h, w, ch = frame.shape
-                    bytes_per_line = ch * w
-                    qimg = QImage(frame.data, w, h, bytes_per_line, QImage.Format_BGR888)
-                    self.image_out.emit(qimg.copy())
-                    await asyncio.sleep(0.03) 
-                else:
-                    self.image_out.emit(QImage())
-                    
-            except Exception as e:
-                print(f">>> [VIDEO ERROR] {e}")
-                await asyncio.sleep(1)
-
-    async def task_gemini_vision_pusher(self):
-        while self.running:
-            await asyncio.sleep(1.0)
-            if self.mode != "none" and self.latest_frame is not None:
-                try:
-                    rgb = cv2.cvtColor(self.latest_frame, cv2.COLOR_BGR2RGB)
-                    pil = PIL.Image.fromarray(rgb)
-                    pil.thumbnail((800, 800))
-                    buf = io.BytesIO()
-                    pil.save(buf, format="jpeg")
-                    await self.q_gemini_in.put({"mime_type": "image/jpeg", "data": base64.b64encode(buf.getvalue()).decode()})
-                except Exception:
-                    pass
-
-    async def task_audio_input(self):
-        try:
-            stream = self.pya.open(format=FORMAT, channels=CHANNELS, rate=SEND_RATE, input=True, frames_per_buffer=CHUNK)
-            while self.running:
-                data = await asyncio.to_thread(stream.read, CHUNK, exception_on_overflow=False)
-                await self.q_gemini_in.put({"data": data, "mime_type": "audio/pcm"})
-        except Exception as e:
-            print(f">>> [AUDIO INPUT ERROR] {e}")
-
+    # ======================================================
+    # ========== TASK TTS (Websocket - Streaming) ==========
+    # ======================================================
     async def task_tts(self):
         uri = f"wss://api.elevenlabs.io/v1/text-to-speech/{VOICE_ID}/stream-input?model_id=eleven_turbo_v2_5&output_format=pcm_24000"
         while self.running:
             text = await self.q_tts_in.get()
-            if not text: self.q_tts_in.task_done(); continue
+            if not text: 
+                self.q_tts_in.task_done()
+                continue
             
+            self.logs_out.emit("INFO", "TTS: Connexion WebSocket...")
             self.voice_state.emit(True)
+            
             try:
                 async with websockets.connect(uri) as ws:
                     await ws.send(json.dumps({"text": " ", "xi_api_key": ELEVENLABS_API_KEY}))
@@ -263,18 +159,23 @@ class AssistantBackend(QObject):
                         nxt = self.q_tts_in.get_nowait()
                         if nxt: await ws.send(json.dumps({"text": nxt + " "}))
                         self.q_tts_in.task_done()
-                    await ws.send(json.dumps({"text": ""}))
+                    await ws.send(json.dumps({"text": ""})) 
 
                     while self.running:
                         msg = await ws.recv()
                         data = json.loads(msg)
                         if data.get("audio"): await self.q_audio_out.put(base64.b64decode(data["audio"]))
                         if data.get("isFinal"): break
-            except Exception as e: print(f"TTS Error: {e}")
+                        
+            except Exception as e: 
+                self.logs_out.emit("ERR", f"TTS WebSocket Error: {e}")
             finally: 
                 self.voice_state.emit(False)
                 self.q_tts_in.task_done()
 
+    # ======================================================
+    # ========== TASK AUDIO OUTPUT (PyAudio) ===============
+    # ======================================================
     async def task_audio_output(self):
         try:
             stream = self.pya.open(format=pyaudio.paInt16, channels=1, rate=RECV_RATE, output=True)
@@ -283,216 +184,431 @@ class AssistantBackend(QObject):
                 await asyncio.to_thread(stream.write, data)
                 self.q_audio_out.task_done()
         except Exception as e:
-            print(f">>> [AUDIO OUTPUT ERROR] {e}")
+            self.logs_out.emit("CRITICAL", f"PyAudio Output Error: {e}. PyAudio installé ?")
 
-    async def run_core(self):
-        # --- INSTRUCTION SYSTEME CORRIGÉE POUR LA VISION ---
-        sys_instruction = """
-        You are NEXUS AI, an advanced assistant with REAL-TIME VISION.
-        IMPORTANT: You are receiving a continuous video stream.
-        1. If the user is sharing their screen (Screen Mode) or Camera, YOU CAN SEE IT.
-        2. Never say "I cannot see" or "I am text-based". Use the visual data provided.
-        3. If the image is black/empty, ask the user to check their camera/screen share.
-        4. Be concise, modern, and helpful.
-        """
-        
-        config = {
-            "response_modalities": ["TEXT"], 
-            "tools": self.tools_config, 
-            "system_instruction": sys_instruction
-        }
+    # ======================================================
+    # ========== TASK STT (Speech-to-Text) =================
+    # ======================================================
+    def stt_task(self):
+        self.stt_active = True
+        self.logs_out.emit("INFO", "STT: Écoute démarrée...")
+        self.stt_out.emit("Écoute en cours...")
         
         try:
-            async with self.client.aio.live.connect(model=MODEL_ID, config=config) as session:
-                self.session = session
-                
-                asyncio.create_task(self.task_camera())
-                asyncio.create_task(self.task_gemini_vision_pusher())
-                asyncio.create_task(self.task_audio_input())
-                asyncio.create_task(self.task_tts())
-                asyncio.create_task(self.task_audio_output())
-
-                async def sender():
-                    while self.running:
-                        item = await self.q_gemini_in.get()
-                        await session.send(input=item)
-                        self.q_gemini_in.task_done()
-                asyncio.create_task(sender())
-
-                async def text_input_handler():
-                    while self.running:
-                        txt = await self.q_text_in.get()
-                        if txt: await session.send(input=txt, end_of_turn=True)
-                        self.q_text_in.task_done()
-                asyncio.create_task(text_input_handler())
-
-                while self.running:
-                    async for chunk in session.receive():
-                        if chunk.tool_call:
-                            responses = []
-                            for fc in chunk.tool_call.function_calls:
-                                res = self._run_tool(fc.name, fc.args)
-                                responses.append({"id": fc.id, "name": fc.name, "response": {"result": res}})
-                                self.logs_out.emit("TOOL", f"{fc.name}: {str(fc.args)} -> {res}")
-                            await session.send_tool_response(function_responses=responses)
-                        
-                        if chunk.server_content:
-                            if chunk.server_content.model_turn:
-                                 for p in chunk.server_content.model_turn.parts:
-                                    if p.executable_code: 
-                                        self.logs_out.emit("CODE", p.executable_code.code)
-                                    if p.code_execution_result:
-                                        self.logs_out.emit("OUTPUT", p.code_execution_result.output)
-
-                            txt = chunk.text
-                            if txt:
-                                self.text_out.emit(txt)
-                                await self.q_tts_in.put(txt)
-                    
-                    self.turn_complete.emit()
-                    await self.q_tts_in.put(None)
+            with self.microphone as source:
+                self.recognizer.adjust_for_ambient_noise(source)
+                # Utiliser listen pour capturer l'audio (bloquant)
+                audio = self.recognizer.listen(source, timeout=5, phrase_time_limit=10)
+            
+            self.logs_out.emit("INFO", "STT: Audio capturé. Reconnaissance...")
+            
+            # Utiliser la reconnaissance vocale Google (nécessite une connexion internet)
+            text = self.recognizer.recognize_google(audio, language="fr-FR")
+            
+            self.stt_out.emit(text) # Envoie le texte à la GUI
+            self.logs_out.emit("INFO", f"STT: Reconnu: {text}")
+            
+            # Déclenche la requête Gemini avec le texte reconnu
+            self.loop.call_soon_threadsafe(self.q_text.put_nowait, text)
+            
+        except sr.WaitTimeoutError:
+            self.logs_out.emit("WARN", "STT: Pas de parole détectée (Timeout).")
+            self.stt_out.emit("Timeout...")
+        except sr.UnknownValueError:
+            self.logs_out.emit("WARN", "STT: Parole inintelligible.")
+            self.stt_out.emit("Parole non comprise.")
         except Exception as e:
-            print(f">>> CRITICAL ERROR: {e}")
+            self.logs_out.emit("ERR", f"STT Error: {e}")
+            self.stt_out.emit(f"Erreur STT: {e}")
+        finally:
+            self.stt_active = False
+            self.logs_out.emit("INFO", "STT: Écoute terminée.")
 
-    def start(self):
-        threading.Thread(target=lambda: self.loop.run_until_complete(self.run_core()), daemon=True).start()
+    # ======================================================
+    # ========== VIDEO FRAME SEND TO GUI ====================
+    # ... (inchangé)
+    # ======================================================
+    def send_to_gui(self, frame):
+        h, w, ch = frame.shape
+        qimg = QImage(frame.data, w, h, w * ch, QImage.Format_BGR888)
+        self.image_out.emit(qimg.copy())
 
-    def stop(self): self.running = False
-    
-    @Slot(str)
-    def set_mode(self, mode):
-        self.mode = mode; self.mode_changed.emit(mode)
-    
-    @Slot(str)
-    def user_input(self, text):
-        self.loop.call_soon_threadsafe(self.q_text_in.put_nowait, text)
+    # ======================================================
+    # ========== CAMERA CAPTURE =============================
+    # ... (inchangé)
+    # ======================================================
+    async def camera_loop(self):
+        cap = None
+        while self.running:
+            if self.mode != MODE_CAMERA:
+                await asyncio.sleep(0.2)
+                continue
 
-# ==============================================================================
-# 3. MODERN GUI
-# ==============================================================================
-class ModernWindow(QMainWindow):
+            if cap is None or not cap.isOpened():
+                for i in range(3):
+                    cam = cv2.VideoCapture(i)
+                    if cam.isOpened():
+                        ret, test = cam.read()
+                        if ret:
+                            cap = cam
+                            break
+                        cam.release()
+
+                if cap is None:
+                    await asyncio.sleep(1)
+                    continue
+
+            ret, frame = await asyncio.to_thread(cap.read)
+            if not ret:
+                cap.release()
+                cap = None
+                await asyncio.sleep(0.2)
+                continue
+
+            self.send_to_gui(frame)
+            self.current_frame = frame
+            
+            await asyncio.sleep(0.05)
+
+    # ======================================================
+    # ========== SCREEN CAPTURE =============================
+    # ... (inchangé)
+    # ======================================================
+    async def screen_loop(self):
+        while self.running:
+            if self.mode != MODE_SCREEN:
+                await asyncio.sleep(0.2)
+                continue
+
+            img = await asyncio.to_thread(ImageGrab.grab)
+            frame = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+
+            self.send_to_gui(frame)
+            self.current_frame = frame
+            
+            await asyncio.sleep(0.1)
+
+    # ======================================================
+    # ========== SYSTEM COMMAND EXECUTION ===================
+    # ... (inchangé)
+    # ======================================================
+    def execute_system_command(self, command: str):
+        self.logs_out.emit("INFO", f"Tentative d'exécution de: {command}")
+        
+        try:
+            if sys.platform.startswith('win'):
+                subprocess.run(f'start {command}', shell=True, check=True)
+            elif sys.platform == 'darwin': 
+                subprocess.run(['open', command], check=True)
+            else: 
+                subprocess.run(['xdg-open', command], check=True)
+            
+            return f"Commande '{command}' exécutée avec succès (tentative de lancement)."
+                
+        except subprocess.CalledProcessError as e:
+            return f"[ERREUR SYSTÈME] Échec de la commande: {e}"
+        except FileNotFoundError:
+             return f"[ERREUR SYSTÈME] Application ou commande non trouvée: {command}"
+        except Exception as e:
+            return f"[ERREUR SYSTÈME] Erreur inattendue: {e}"
+
+    # ======================================================
+    # ========== MODEL CALL =================================
+    # ... (inchangé)
+    # ======================================================
+    def model_call(self, contents):
+        try:
+            resp = self.client.models.generate_content(
+                model=MODEL_ID,
+                contents=contents
+            )
+            return resp.text if hasattr(resp, "text") else str(resp)
+
+        except Exception as e:
+            return f"[API ERROR] {str(e)}"
+
+    # ======================================================
+    # ========== IMAGE ANALYSIS =============================
+    # ======================================================
+    async def analyze_image(self, prompt: str): 
+        if self.current_frame is None:
+            self.logs_out.emit("WARN", "Pas d'image actuelle pour l'analyse.")
+            return
+
+        try:
+            frame = self.current_frame
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            pil = PILImage.fromarray(rgb)
+            
+            pil.thumbnail((800, 800)) 
+            
+            buf = io.BytesIO()
+            pil.save(buf, format="JPEG") 
+            img_bytes = buf.getvalue()
+
+            img_part = Part.from_bytes(
+                data=img_bytes,
+                mime_type='image/jpeg' 
+            )
+
+            result = await asyncio.to_thread(
+                self.model_call,
+                [img_part, prompt] 
+            )
+
+            self.text_out.emit(result)
+            self.loop.call_soon_threadsafe(self.q_tts_in.put_nowait, result) 
+
+        except Exception as e:
+            self.logs_out.emit("ERR", str(e))
+
+    # ======================================================
+    # ========== MAIN BACKEND LOOP (MAJ AUDIO) =============
+    # ======================================================
+    async def main_loop(self):
+        self.logs_out.emit("INFO", "Backend ready")
+
+        # Démarrage des tâches asynchrones (Camera/Screen, TTS, Audio Output)
+        asyncio.create_task(self.camera_loop())
+        asyncio.create_task(self.screen_loop())
+        asyncio.create_task(self.task_tts())
+        asyncio.create_task(self.task_audio_output())
+
+        SYSTEM_PROMPT_COMMAND = (
+            "Vous êtes un assistant capable d'exécuter des commandes système. "
+            "Si l'utilisateur demande d'ouvrir une application (comme 'ouvrir Spotify') ou "
+            "un site web (comme 'ouvrir google.com'), vous DEVEZ répondre UNIQUEMENT avec "
+            "le format: <EXECUTE>cible</EXECUTE> (où 'cible' est l'application ou l'URL à ouvrir, "
+            "ex: <EXECUTE>spotify</EXECUTE> ou <EXECUTE>https://www.google.com</EXECUTE>). "
+            "Pour toute autre question, répondez normalement."
+        )
+
+        while self.running:
+            # GESTION DES REQUÊTES TEXTE
+            if not self.q_text.empty():
+                user_text = await self.q_text.get()
+                
+                contents = [
+                    {"role": "user", "parts": [{"text": SYSTEM_PROMPT_COMMAND}]},
+                    {"role": "user", "parts": [{"text": user_text}]}
+                ]
+                
+                result_text = await asyncio.to_thread(
+                    self.model_call,
+                    contents
+                )
+
+                # Traitement de la commande
+                if result_text.startswith("<EXECUTE>") and result_text.endswith("</EXECUTE>"):
+                    command_to_exec = result_text.strip()[len("<EXECUTE>"): -len("</EXECUTE>")].strip()
+                    execution_status = self.execute_system_command(command_to_exec)
+                    
+                    final_output = f"Exécution demandée... Statut: {execution_status}"
+                    self.text_out.emit(f"<span style='color: orange;'>[COMMANDE SYSTÈME] {final_output}</span>")
+                    
+                else:
+                    # Réponse normale
+                    self.text_out.emit(result_text)
+                    # Déclenche la lecture audio par file d'attente TTS
+                    self.loop.call_soon_threadsafe(self.q_tts_in.put_nowait, result_text) 
+                    
+                self.q_text.task_done()
+            
+            # GESTION DES REQUÊTES VISION
+            if not self.q_vision.empty():
+                user_prompt = await self.q_vision.get()
+                await self.analyze_image(user_prompt)
+                self.q_vision.task_done()
+
+            await asyncio.sleep(0.05)
+
+
+# ======================================================
+# ======================= GUI ==========================
+# ======================================================
+
+class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("NEXUS AI")
+        self.setWindowTitle("NEXUS – STT Intégration")
         self.resize(1300, 800)
+
+        central = QWidget()
+        self.setCentralWidget(central)
+
+        main = QHBoxLayout(central)
+
+        # LEFT (Chat)
+        left = QVBoxLayout()
+
+        self.chat = QTextEdit()
+        self.chat.setReadOnly(True)
+        left.addWidget(self.chat)
         
-        self.setStyleSheet("""
-            QMainWindow { background-color: #1e1e1e; color: #f0f0f0; font-family: 'Segoe UI', sans-serif; }
-            QWidget { font-size: 14px; }
-            QFrame#panel { background-color: #252526; border-radius: 12px; border: 1px solid #333; }
-            QLabel#log_title { color: #ffb300; font-weight: bold; font-size: 12px; letter-spacing: 1px; }
-            QTextEdit#logs { background: transparent; border: none; color: #aaaaaa; font-family: 'Consolas', monospace; font-size: 12px; }
-            QTextEdit#chat { background: transparent; border: none; padding: 10px; font-size: 15px; line-height: 1.4; }
-            QLineEdit { 
-                background-color: #2d2d30; border: 2px solid #3e3e42; border-radius: 20px; 
-                padding: 10px 20px; color: white; selection-background-color: #ffb300;
-            }
-            QLineEdit:focus { border: 2px solid #ffb300; }
-            QPushButton {
-                background-color: #2d2d30; color: #dddddd; border: none; border-radius: 8px;
-                padding: 8px 16px; font-weight: 600;
-            }
-            QPushButton:hover { background-color: #3e3e42; color: white; }
-            QPushButton:checked { background-color: #ffb300; color: #1e1e1e; }
-            QScrollBar:vertical { background: #1e1e1e; width: 8px; }
-            QScrollBar::handle:vertical { background: #444; border-radius: 4px; }
-        """)
-
-        central = QWidget(); self.setCentralWidget(central)
-        main_layout = QHBoxLayout(central); main_layout.setContentsMargins(20, 20, 20, 20); main_layout.setSpacing(20)
-
-        left_col = QVBoxLayout()
-        self.chat_display = QTextEdit(); self.chat_display.setObjectName("chat")
-        self.chat_display.setReadOnly(True)
-        chat_frame = QFrame(); chat_frame.setObjectName("panel"); chat_layout = QVBoxLayout(chat_frame)
-        chat_layout.addWidget(self.chat_display)
-        left_col.addWidget(chat_frame, 1)
-
+        # Ajout du Visualizer audio
         self.visualizer = AudioVisualizer()
-        left_col.addWidget(self.visualizer)
+        left.addWidget(self.visualizer)
 
-        inp_layout = QHBoxLayout()
-        self.input_box = QLineEdit(); self.input_box.setPlaceholderText("Message Nexus AI...")
-        self.input_box.returnPressed.connect(self.send_message)
-        inp_layout.addWidget(self.input_box)
-        left_col.addLayout(inp_layout)
-        main_layout.addLayout(left_col, 6)
+        # Input/STT Box
+        input_stt_box = QVBoxLayout()
 
-        right_col = QVBoxLayout()
-        self.video_label = QLabel("Camera Off"); self.video_label.setAlignment(Qt.AlignCenter)
-        self.video_label.setStyleSheet("background-color: black; border-radius: 12px; color: #555;")
-        self.video_label.setMinimumHeight(250)
-        self.video_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        right_col.addWidget(self.video_label)
-
-        ctrl_layout = QHBoxLayout()
-        self.btn_cam = QPushButton("CAMERA"); self.btn_cam.setCheckable(True)
-        self.btn_scr = QPushButton("SCREEN"); self.btn_scr.setCheckable(True)
-        self.btn_off = QPushButton("OFF"); self.btn_off.setCheckable(True); self.btn_off.setChecked(True)
+        # Champ de texte (inchangé)
+        text_input_box = QHBoxLayout()
+        self.input = QLineEdit()
+        self.input.returnPressed.connect(self.send_message)
+        btn_send = QPushButton("Envoyer")
+        btn_send.clicked.connect(self.send_message)
+        text_input_box.addWidget(self.input)
+        text_input_box.addWidget(btn_send)
         
-        self.btn_cam.clicked.connect(lambda: self.switch_mode("camera"))
-        self.btn_scr.clicked.connect(lambda: self.switch_mode("screen"))
-        self.btn_off.clicked.connect(lambda: self.switch_mode("none"))
+        input_stt_box.addLayout(text_input_box)
         
-        ctrl_layout.addWidget(self.btn_cam); ctrl_layout.addWidget(self.btn_scr); ctrl_layout.addWidget(self.btn_off)
-        right_col.addLayout(ctrl_layout)
+        # Bouton STT (Nouveau)
+        self.btn_stt = QPushButton("🎙️ Parler à l'IA")
+        self.btn_stt.clicked.connect(self.start_stt)
+        self.btn_stt.setEnabled(True)
+        input_stt_box.addWidget(self.btn_stt)
 
-        log_frame = QFrame(); log_frame.setObjectName("panel")
-        log_layout = QVBoxLayout(log_frame)
-        log_layout.addWidget(QLabel("SYSTEM LOGS", objectName="log_title"))
-        self.logs_display = QTextEdit(); self.logs_display.setObjectName("logs"); self.logs_display.setReadOnly(True)
-        log_layout.addWidget(self.logs_display)
-        right_col.addWidget(log_frame, 1)
+        left.addLayout(input_stt_box)
+        main.addLayout(left, 6)
 
-        main_layout.addLayout(right_col, 4)
+        # RIGHT (Video + Logs + Modes)
+        right = QVBoxLayout()
 
-        self.backend = AssistantBackend()
-        self.backend.text_out.connect(self.append_text)
+        self.video = QLabel("Aucune source")
+        self.video.setStyleSheet("background:black; color:#bbb;")
+        self.video.setAlignment(Qt.AlignCenter)
+        self.video.setMinimumHeight(300)
+        right.addWidget(self.video)
+
+        mode_bar = QHBoxLayout()
+
+        self.btn_text = QPushButton("TEXTE")
+        self.btn_text.setCheckable(True)
+        self.btn_text.setChecked(True)
+        self.btn_text.clicked.connect(lambda: self.set_mode(MODE_TEXT))
+
+        self.btn_cam = QPushButton("CAMERA")
+        self.btn_cam.setCheckable(True)
+        self.btn_cam.clicked.connect(lambda: self.set_mode(MODE_CAMERA))
+
+        self.btn_screen = QPushButton("ÉCRAN")
+        self.btn_screen.setCheckable(True)
+        self.btn_screen.clicked.connect(lambda: self.set_mode(MODE_SCREEN))
+
+        mode_bar.addWidget(self.btn_text)
+        mode_bar.addWidget(self.btn_cam)
+        mode_bar.addWidget(self.btn_screen)
+
+        right.addLayout(mode_bar)
+
+        self.logs = QTextEdit()
+        self.logs.setReadOnly(True)
+        right.addWidget(self.logs)
+
+        main.addLayout(right, 4)
+
+        # Backend
+        self.backend = Backend()
+        self.backend.text_out.connect(self.on_ai_output)
         self.backend.image_out.connect(self.update_video)
-        self.backend.logs_out.connect(self.append_log)
-        self.backend.turn_complete.connect(lambda: self.chat_display.append(""))
+        self.backend.logs_out.connect(self.add_log)
         self.backend.voice_state.connect(self.visualizer.set_active)
+        self.backend.stt_out.connect(self.on_stt_output) # Connexion du signal STT
         self.backend.start()
 
-    def send_message(self):
-        text = self.input_box.text().strip()
-        if text:
-            self.chat_display.append(f"<div style='color:#aaaaaa; margin-top:10px;'>YOU: {escape(text)}</div>")
-            self.backend.user_input(text)
-            self.input_box.clear()
+    # --- NOUVELLES MÉTHODES STT ---
+    def start_stt(self):
+        if not self.backend.stt_active:
+            self.btn_stt.setText("🔴 ENREGISTREMENT... (Stop)")
+            self.btn_stt.clicked.disconnect(self.start_stt)
+            self.btn_stt.clicked.connect(self.stop_stt)
+            # Lancer la tâche STT dans un thread séparé (elle est bloquante)
+            threading.Thread(target=self.backend.stt_task, daemon=True).start()
+        else:
+            self.stop_stt()
+
+    def stop_stt(self):
+        # Cette fonction est principalement pour l'interface utilisateur. 
+        # L'arrêt réel se fait par timeout dans la tâche bloquante.
+        self.btn_stt.setText("🎙️ Parler à l'IA")
+        self.btn_stt.clicked.disconnect(self.stop_stt)
+        self.btn_stt.clicked.connect(self.start_stt)
+        # Note: Impossible d'arrêter proprement sr.listen() sans un thread dédié
+        # ou un hack complexe. On se fie au timeout de sr.listen().
 
     @Slot(str)
-    def append_text(self, text):
-        cursor = self.chat_display.textCursor()
-        cursor.movePosition(QTextCursor.End)
-        cursor.insertHtml(f"<span style='color:#ffffff;'>{escape(text)}</span>")
-        self.chat_display.setTextCursor(cursor)
-        self.chat_display.verticalScrollBar().setValue(self.chat_display.verticalScrollBar().maximum())
+    def on_stt_output(self, text):
+        if text not in ["Écoute en cours...", "Timeout...", "Parole non comprise.", "Erreur STT:"]:
+            # Si un texte réel est reconnu, l'ajouter au chat
+            self.chat.append(f"<b>VOUS (Vocal):</b> {escape(text)}")
+            self.stop_stt() # Reset le bouton après la reconnaissance
+        elif text.startswith("Erreur") or text.endswith("..."):
+            self.stop_stt() # Reset le bouton après un échec/timeout
+        else:
+            # Afficher l'état dans la ligne d'entrée ou la barre de logs
+            self.input.setText(f"STT: {text}")
+
+
+    # MODE SWITCH
+    def set_mode(self, mode):
+        self.backend.mode = mode
+
+        self.btn_text.setChecked(mode == MODE_TEXT)
+        self.btn_cam.setChecked(mode == MODE_CAMERA)
+        self.btn_screen.setChecked(mode == MODE_SCREEN)
+
+        if mode == MODE_TEXT:
+            self.video.setText("Aucune source")
+            self.btn_stt.setEnabled(True)
+        elif mode == MODE_CAMERA:
+            self.video.setText("Caméra…")
+            self.btn_stt.setEnabled(False)
+        elif mode == MODE_SCREEN:
+            self.video.setText("Capture écran…")
+            self.btn_stt.setEnabled(False)
+
+    # MESSAGE SEND
+    def send_message(self):
+        msg = self.input.text().strip()
+        if not msg:
+            return
+            
+        self.chat.append(f"<b>YOU:</b> {escape(msg)}")
+
+        if self.backend.mode == MODE_TEXT:
+            self.backend.loop.call_soon_threadsafe(self.backend.q_text.put_nowait, msg)
+        else:
+            self.backend.loop.call_soon_threadsafe(self.backend.q_vision.put_nowait, msg)
+
+        self.input.clear()
+
+    @Slot(str)
+    def on_ai_output(self, text):
+        if text.startswith("<span style='color: orange;'>"):
+             self.chat.append(text)
+        else:
+            self.chat.append(f"<span style='color:#4af;'>{escape(text)}</span>")
 
     @Slot(str, str)
-    def append_log(self, title, content):
-        self.logs_display.append(f"<b style='color:#ffb300;'>[{title}]</b> {escape(content)}")
-    
+    def add_log(self, t, c):
+        self.logs.append(f"[{t}] {c}")
+
     @Slot(QImage)
-    def update_video(self, image):
-        if image.isNull(): 
-            self.video_label.clear(); self.video_label.setText("Camera Off")
-        else:
-            pix = QPixmap.fromImage(image)
-            self.video_label.setPixmap(pix.scaled(self.video_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
-
-    def switch_mode(self, mode):
-        self.btn_cam.setChecked(mode == "camera")
-        self.btn_scr.setChecked(mode == "screen")
-        self.btn_off.setChecked(mode == "none")
-        self.backend.set_mode(mode)
-
+    def update_video(self, img):
+        pix = QPixmap.fromImage(img)
+        self.video.setPixmap(
+            pix.scaled(self.video.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        )
+    
     def closeEvent(self, event):
         self.backend.stop()
         event.accept()
 
+
+# APP
 if __name__ == "__main__":
     app = QApplication(sys.argv)
-    window = ModernWindow()
-    window.show()
+    win = MainWindow()
+    win.show()
     sys.exit(app.exec())
